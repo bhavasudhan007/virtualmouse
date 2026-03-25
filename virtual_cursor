@@ -19,6 +19,7 @@ import cv2
 import mediapipe as mp
 import pyautogui
 from pynput.mouse import Controller, Button
+import pygetwindow as gw
 
 import util
 
@@ -49,11 +50,11 @@ class GestureConfig:
     stop_dist_threshold: float = 6.0
     stop_time_threshold: float = 0.25
     half_fold_low: float = 45.0
-    half_fold_high: float = 95.0
+    half_fold_high: float = 70.0  # further lowered
     scroll_sensitivity: float = 0.55
     scroll_smooth_alpha: float = 0.72
     # Angle threshold to detect the thumb as 'open' (degrees)
-    thumb_angle_threshold: float = 50.0
+    thumb_angle_threshold: float = 70.0  # relaxed
 
 
 class GestureController:
@@ -85,6 +86,20 @@ class GestureController:
         self._scroll_gesture_time = 0.0
         # When True the main loop should exit (set by Thumb+Pinky gesture)
         self._should_exit = False
+
+        # Tab swipe state (three-finger Alt+Tab)
+        self._tab_swipe_threshold = 20  # pixels, lowered for easier detection
+        self._tab_swipe_cooldown = 1.0
+        self._last_tab_swipe_time = 0.0
+        self._tab_swipe_start_x = None
+
+        # Window swipe state (four-finger Win+Tab)
+        self._win_swipe_threshold = 20  # similar sensitivity
+        self._last_win_swipe_time = 0.0
+        self._win_swipe_start_x = None
+
+        # Orientation scroll state
+        self._last_scroll_sent = 0.0  # timestamp of last orientation-based scroll event
 
     # -- Gesture helpers -------------------------------------------------
     @staticmethod
@@ -169,9 +184,9 @@ class GestureController:
             avg_tip_wrist = 0.0
 
         # Debug overlays
-        cv2.putText(frame, f"thumb_dist:{thumb_index_dist:.1f}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, f"palm_avg:{avg_tip_wrist:.1f}", (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, f"palm_state:{'closed' if self._palm_was_closed else 'open'}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+        #cv2.putText(frame, f"thumb_dist:{thumb_index_dist:.1f}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        #cv2.putText(frame, f"palm_avg:{avg_tip_wrist:.1f}", (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        #cv2.putText(frame, f"palm_state:{'closed' if self._palm_was_closed else 'open'}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
 
         # palm close->open screenshot
         if avg_tip_wrist < cfg.palm_closed_threshold:
@@ -185,9 +200,10 @@ class GestureController:
                 logger.info("Screenshot full path: %s", file_path)
                 print(f"Screenshot saved: {file_name}")
                 sys.stdout.flush()
-                cv2.putText(frame, f"Saved: {file_name}", (50, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                #cv2.putText(frame, f"Saved: {file_name}", (50, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
             else:
-                cv2.putText(frame, "Screenshot failed", (50, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                #cv2.putText(frame, "Screenshot failed", (50, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                pass
             self._last_click_time = now
             self._palm_was_closed = False
 
@@ -216,119 +232,77 @@ class GestureController:
 
         self._last_index_pos = current_index_screen
 
-        # -- Simplified Scroll Logic --
-        # Condition: Thumb not pinched (Move Mode) AND Index & Middle fingers Extended.
+        # -- Thumb up/down scroll gesture --
+        # Scroll up when thumb is raised and others are folded.
+        # Scroll down when thumb is lowered and others are folded.
         index_angle = util.get_angle(landmark_list[5], landmark_list[6], landmark_list[8])
         middle_angle = util.get_angle(landmark_list[9], landmark_list[10], landmark_list[12])
-
-        cv2.putText(frame, f"idx_ang:{index_angle:.1f} mid_ang:{middle_angle:.1f}", (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(frame, f"thumb:{thumb_index_dist:.1f}", (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-        # Check if we should be in scroll mode
-        # User-request: Only enable scrolling when the Index and Middle fingers are FOLDED.
-        # Folded is indicated by smaller joint angles; use the configured half_fold_low as threshold.
-        is_scroll_posture = (index_angle < cfg.half_fold_low and middle_angle < cfg.half_fold_low)
-        
-        # Compute pinky state early so it can act as an explicit "close scroll" gesture
-        pinky_angle = util.get_angle(landmark_list[17], landmark_list[18], landmark_list[20])
-        pinky_open = pinky_angle > 95
-        cv2.putText(frame, f"Pinky: {int(pinky_angle)} {'DOWN (Open)' if pinky_open else 'UP (Closed)'}", (10, 195), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
-
-        # Compute thumb openness more robustly using the thumb joint angles
-        thumb_angle = util.get_angle(landmark_list[2], landmark_list[3], landmark_list[4])
-        thumb_open = thumb_angle > cfg.thumb_angle_threshold
-        cv2.putText(frame, f"thumb_ang:{thumb_angle:.1f} open:{int(thumb_open)}", (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
-
-        # Compute ring finger angle to ensure only thumb+pinky are extended
         ring_angle = util.get_angle(landmark_list[13], landmark_list[14], landmark_list[16])
+        pinky_angle = util.get_angle(landmark_list[17], landmark_list[18], landmark_list[20])
+        thumb_angle = util.get_angle(landmark_list[2], landmark_list[3], landmark_list[4])
+
+        thumb_tip = landmark_list[4]
+        thumb_mcp = landmark_list[2]
+        dy_thumb = thumb_tip[1] - thumb_mcp[1]  # normalized coordinates (positive = downward)
+
+        orient = 0  # 1=scroll up, -1=scroll down, 0=neutral
+        thumb_extended = thumb_angle > cfg.thumb_angle_threshold and abs(dy_thumb) > 0.05
+        others_folded = (
+            index_angle < cfg.half_fold_low
+            and middle_angle < cfg.half_fold_low
+            and ring_angle < cfg.half_fold_low
+            and pinky_angle < cfg.half_fold_low
+        )
+
+        if thumb_extended and others_folded:
+            if dy_thumb < -0.06:
+                orient = 1
+            elif dy_thumb > 0.06:
+                orient = -1
+
+        # update scroll mode (prevents accidental mouse movement while scrolling)
+        self._scroll_mode = orient != 0
+        # debug overlays
+        #cv2.putText(frame, f"idx_ang:{index_angle:.1f} thumb_ang:{thumb_angle:.1f}", (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        #cv2.putText(frame, f"orient:{orient} thumb_dy:{dy_thumb:.3f}", (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # scroll handling
+        now = time.time()
+        if orient != 0:
+            # send periodic scroll events while orientation holds
+            if (now - self._last_scroll_sent) > 0.2:
+                amount = orient * 120  # adjust magnitude as needed
+                try:
+                    pyautogui.scroll(amount)
+                except Exception:
+                    logger.exception("Orientation scroll failed")
+                self._last_scroll_sent = now
+        else:
+            # reset timer when neutral
+            self._last_scroll_sent = now
+
+        # We'll still compute other finger angles for unrelated gestures
+        middle_angle = util.get_angle(landmark_list[9], landmark_list[10], landmark_list[12])
+        pinky_angle = util.get_angle(landmark_list[17], landmark_list[18], landmark_list[20])
+        thumb_angle = util.get_angle(landmark_list[2], landmark_list[3], landmark_list[4])
+        ring_angle = util.get_angle(landmark_list[13], landmark_list[14], landmark_list[16])
+        pinky_open = pinky_angle > 95
+        thumb_open = thumb_angle > cfg.thumb_angle_threshold
         ring_folded = ring_angle < cfg.half_fold_low
 
-        # Debug: show computed posture booleans and current scroll state
-        cv2.putText(frame, f"is_scroll_posture:{int(is_scroll_posture)} thumb_dist:{int(thumb_index_dist)} scroll:{int(self._scroll_mode)}", (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
-        cv2.putText(frame, f"ring_ang:{ring_angle:.1f} folded:{int(ring_folded)}", (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
-
-        # Special gesture: Thumb + Pinky -> exit program (require short hold to avoid accidental triggers)
-        # Require BOTH thumb_open and pinky_open AND other fingers folded (prevents full-palm-open from triggering exit)
+        # exit posture detection (thumb + pinky held, others folded)
         exit_posture = bool(thumb_open and pinky_open and index_angle < cfg.half_fold_low and middle_angle < cfg.half_fold_low and ring_folded)
-        cv2.putText(frame, f"exit_posture:{int(exit_posture)}", (10, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 200), 2)
-
+        #cv2.putText(frame, f"exit_posture:{int(exit_posture)}", (10, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 200), 2)
         if exit_posture:
             if self._scroll_gesture_time == 0.0:
                 self._scroll_gesture_time = now
-            elif (now - self._scroll_gesture_time) > 0.15:  # 150 ms hold
-                # Trigger program exit
+            elif (now - self._scroll_gesture_time) > 0.15:
                 self._should_exit = True
                 logger.info("Exit requested by Thumb+Pinky gesture (strict posture)")
-                cv2.putText(frame, "Exit requested (Thumb+Pinky)", (50, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-                # reset timer after action
+                #cv2.putText(frame, "Exit requested (Thumb+Pinky)", (50, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
                 self._scroll_gesture_time = 0.0
         else:
-            # reset debounce timer when gesture not present
             self._scroll_gesture_time = 0.0
-
-            if thumb_index_dist >= cfg.thumb_threshold:
-                if is_scroll_posture:
-                    if not self._scroll_mode:
-                        # Entered scroll mode this frame
-                        self._scroll_mode = True
-                        self._last_scroll_y = current_index_screen[1]
-                        self._scroll_accum = 0.0
-                        logger.info("Scroll mode entered (Index+Middle folded)")
-                    
-                    cv2.putText(frame, "Scroll Mode ACTIVE", (50, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 200, 0), 2)
-                else:
-                    self._scroll_mode = False
-            else:
-                # Pinching (Move Mode) exits scroll mode
-                self._scroll_mode = False
-
-        # Execute Scroll
-        # Execute Scroll
-        if self._scroll_mode:
-            # -- Direction Lock Logic --
-            # User Request: Pinky Open = Scroll Down. Pinky Closed = Scroll Up.
-            # Speed is determined by how fast hand moves (absolute distance), regardless of direction.
-            
-            scroll_dy = current_index_screen[1] - self._last_scroll_y
-            move_magnitude = abs(scroll_dy)
-            
-            # Use earlier computed pinky state (thumb+pinky closure gesture handled above)
-            p_state = "DOWN (Open)" if pinky_open else "UP (Closed)"
-            # Display Pinky State for Debug
-            cv2.putText(frame, f"Pinky: {int(pinky_angle)} {p_state}", (10, 195), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
-            
-            # 1. Deadzone
-            if move_magnitude < 5:
-                move_magnitude = 0.0
-            
-            # 2. Sensitivity & Direction
-            # Positive Scroll = UP. Negative Scroll = DOWN.
-            factor = 6.0
-            
-            if pinky_open:
-                # Force Scroll DOWN (Negative)
-                target_scroll = -1 * move_magnitude * factor
-            else:
-                # Force Scroll UP (Positive)
-                target_scroll = 1 * move_magnitude * factor
-
-            # Simple smoothing
-            self._scroll_vel = cfg.scroll_smooth_alpha * self._scroll_vel + (1 - cfg.scroll_smooth_alpha) * target_scroll
-            self._scroll_accum += self._scroll_vel
-
-            # 3. Accumulate
-            send = int(self._scroll_accum)
-            
-            if abs(send) >= 20: 
-                try:
-                    pyautogui.scroll(send)
-                    self._scroll_accum -= send
-                except Exception:
-                    logger.exception("Scroll failed")
-            
-            self._last_scroll_y = current_index_screen[1]
-            
-            cv2.putText(frame, f"Scroll: {send} ({p_state})", (50, 170), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
 
         # movement vs clicks
         if self._scroll_mode:
@@ -340,19 +314,89 @@ class GestureController:
                 self.mouse.press(Button.left)
                 self.mouse.release(Button.left)
                 self._last_click_time = now
-                cv2.putText(frame, "Left Click", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                #cv2.putText(frame, "Left Click", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             elif self._is_right_click(landmark_list, thumb_index_dist) and (now - self._last_click_time) > cfg.click_cooldown:
                 self.mouse.press(Button.right)
                 self.mouse.release(Button.right)
                 self._last_click_time = now
-                cv2.putText(frame, "Right Click", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                #cv2.putText(frame, "Right Click", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             elif self._is_double_click(landmark_list, thumb_index_dist) and (now - self._last_click_time) > cfg.click_cooldown:
                 try:
                     pyautogui.doubleClick()
                 except Exception:
                     logger.exception("Double click failed")
                 self._last_click_time = now
-                cv2.putText(frame, "Double Click", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                #cv2.putText(frame, "Double Click", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        # App/window switch gestures
+        # compute finger extension states
+        index_extended = index_angle > cfg.half_fold_high
+        middle_extended = middle_angle > cfg.half_fold_high
+        ring_extended = ring_angle > cfg.half_fold_high
+        pinky_extended = pinky_angle > cfg.half_fold_high
+
+        # three-finger posture for Alt+Tab
+        three_posture = (
+            index_extended and
+            middle_extended and
+            ring_extended and
+            not self._scroll_mode
+        )
+
+        # four-finger posture for Win+Tab (task view)
+        four_posture = (
+            index_extended and
+            middle_extended and
+            ring_extended and
+            pinky_extended and
+            not self._scroll_mode
+        )
+
+        #cv2.putText(frame, f"3f:{int(three_posture)} 4f:{int(four_posture)}", (10, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        #cv2.putText(frame, f"idx:{int(index_extended)} mid:{int(middle_extended)} ring:{int(ring_extended)} pinky:{int(pinky_extended)}", (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+
+        # prefer the four-finger gesture if both are detected
+        if four_posture:
+            # evaluate average of four fingertips
+            xs = [landmark_list[8][0], landmark_list[12][0], landmark_list[16][0], landmark_list[20][0]]
+            avg_x = sum(x * SCREEN_WIDTH for x in xs) / 4
+            if self._win_swipe_start_x is None:
+                self._win_swipe_start_x = avg_x
+            else:
+                delta_x = avg_x - self._win_swipe_start_x
+                #cv2.putText(frame, f"delta_x:{delta_x:.1f}", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+                if abs(delta_x) > self._win_swipe_threshold and (now - self._last_win_swipe_time) > self._tab_swipe_cooldown:
+                    if delta_x > 0:
+                        pyautogui.hotkey('win', 'tab')
+                        #cv2.putText(frame, "Win+Tab ➜", (50, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                    else:
+                        pyautogui.hotkey('win', 'shift', 'tab')
+                        #cv2.putText(frame, "Win+Shift+Tab ◀", (50, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                    self._last_win_swipe_time = now
+                    self._win_swipe_start_x = None
+        elif three_posture:
+            # three-finger Alt+Tab logic
+            xs = [landmark_list[8][0], landmark_list[12][0], landmark_list[16][0]]
+            avg_x = sum(x * SCREEN_WIDTH for x in xs) / 3
+            if self._tab_swipe_start_x is None:
+                self._tab_swipe_start_x = avg_x
+            else:
+                delta_x = avg_x - self._tab_swipe_start_x
+                #cv2.putText(frame, f"delta_x:{delta_x:.1f}", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+                if abs(delta_x) > self._tab_swipe_threshold and (now - self._last_tab_swipe_time) > self._tab_swipe_cooldown:
+                    if delta_x > 0:
+                        pyautogui.hotkey('alt', 'tab')
+                        #cv2.putText(frame, "Alt+Tab ➜", (50, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                    else:
+                        pyautogui.hotkey('alt', 'shift', 'tab')
+                        #cv2.putText(frame, "Alt+Shift+Tab ◀", (50, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                    self._last_tab_swipe_time = now
+                    self._tab_swipe_start_x = None
+        else:
+            # reset starts when posture is lost
+            self._tab_swipe_start_x = None
+            self._win_swipe_start_x = None
+
 
     # -- Run loop --------------------------------------------------------
     def run(self, show_window: bool = True) -> None:
